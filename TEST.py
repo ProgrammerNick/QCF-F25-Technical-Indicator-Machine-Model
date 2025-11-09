@@ -16,8 +16,8 @@ class Config:
     ticker: str = "SPY"
     period: str = "10y"
     start: str = None
-    end: str = "2025-11-02"  # Cap testing to last week
-    train_end: str = "2024-10-31"  # Leave room for test data until Nov 2
+    end: str = None
+    train_end: str = "2024-12-31"  # Updated to have recent training data
     proba_threshold: float = 0.55
     fee_bps: float = 1.0
     model: str = "rf"
@@ -25,16 +25,8 @@ class Config:
 CFG = Config()
 
 def fetch_prices(ticker, start=None, end=None, period="10y"):
-    if start and end:
+    if start or end:
         df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-    elif end and not start:
-        # If only end is specified, get 10 years of data up to end date
-        import datetime
-        end_dt = pd.to_datetime(end)
-        start_dt = end_dt - pd.DateOffset(years=10)
-        df = yf.download(ticker, start=start_dt.strftime('%Y-%m-%d'), end=end, auto_adjust=True, progress=False)
-    elif start and not end:
-        df = yf.download(ticker, start=start, auto_adjust=True, progress=False)
     else:
         df = yf.download(ticker, period=period, auto_adjust=True, progress=False)
     # Flatten MultiIndex columns and rename
@@ -129,7 +121,10 @@ if len(X_test) > 0:
     proba = best.predict_proba(X_test)
     pos_col = list(best.named_steps["model"].classes_).index(1)
     p_up = pd.Series(proba[:, pos_col], index=X_test.index)
-    signal = (p_up >= CFG.proba_threshold).astype(int)
+    # New "3-day confirmation" logic
+    raw_signal = (p_up >= CFG.proba_threshold).astype(int)
+    # The signal is active only if it has been active for the last 3 consecutive days
+    signal = (raw_signal.rolling(window=3).sum() == 3).astype(int)
 else:
     p_up = pd.Series(dtype=float)
     signal = pd.Series(dtype=int)
@@ -149,6 +144,13 @@ def backtest(close, signal, fee_bps=1.0):
     return strat_ret, eq, bh
 
 strat_ret, eq, bh = backtest(px.loc[signal.index, "close"], signal, fee_bps=CFG.fee_bps)
+# --- Strategy Description ---
+print("--- Trading Strategy Description ---")
+print(f"The trading strategy is based on a {CFG.model.upper()} model that predicts the probability of the ticker price going up.")
+print(f"A buy signal is generated when the model's predicted probability of an upward price movement is >= {CFG.proba_threshold} for 3 consecutive days.")
+print("A sell signal is generated when this condition is no longer met.")
+print("------------------------------------")
+
 def perf(strat_ret):
     ann = 252
     if len(strat_ret) == 0:
@@ -162,50 +164,52 @@ def perf(strat_ret):
     return {"CAGR": cagr, "Vol": vol, "Sharpe": sharpe, "MaxDD": mdd, "HitRate": hit}
 metrics = perf(strat_ret)
 print(pd.Series(metrics))
-plt.figure(figsize=(10,5))
-plt.plot(eq.index, eq.values, label="Strategy")
-plt.plot(bh.index, bh.values, label="Buy & Hold")
-plt.title(f"Test Equity Curve ({CFG.ticker})")
-plt.legend()
-plt.savefig('equity_curve.png')
-plt.close()
+# --- Visualization ---
+if len(X_test) > 0:
+    # Differentiate the signal to find changes
+    sig_diff = signal.diff()
+    buy_signals = sig_diff[sig_diff == 1].index
+    sell_signals = sig_diff[sig_diff == -1].index
 
-# Save the signals plot
-prices = px.loc[signal.index] # Align prices with signals
+    # Get the close prices for the test period
+    test_closes = px.loc[X_test.index, "close"]
 
-# Identify buy and sell points
-shifted_signal = signal.shift(1).fillna(0)
+    # Create a figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
 
-buy_signals = (signal == 1) & (shifted_signal == 0)
-sell_signals = (signal == 0) & (shifted_signal == 1)
+    # Plot 1: Close Price with Buy/Sell Signals
+    ax1.plot(test_closes.index, test_closes, label='Close Price', alpha=0.7)
+    ax1.plot(buy_signals, test_closes.loc[buy_signals], '^', markersize=10, color='green', label='Buy Signal', alpha=1)
+    ax1.plot(sell_signals, test_closes.loc[sell_signals], 'v', markersize=10, color='red', label='Sell Signal', alpha=1)
+    ax1.set_title(f'{CFG.ticker} Buy and Sell Signals on Test Set')
+    ax1.set_ylabel('Price')
+    ax1.legend()
+    ax1.grid(True)
 
-buy_points = prices[buy_signals]
-sell_points = prices[sell_signals]
+    # Plot 2: Equity Curves
+    ax2.plot(eq.index, eq.values, label="Strategy")
+    ax2.plot(bh.index, bh.values, label="Buy & Hold")
+    ax2.set_title(f"Test Equity Curve ({CFG.ticker})")
+    ax2.set_ylabel('Equity')
+    ax2.legend()
+    ax2.grid(True)
 
-# Create the plot
-plt.style.use('seaborn-v0_8-darkgrid')
-fig, ax = plt.subplots(figsize=(15, 7))
+    plt.xlabel('Date')
+    plt.tight_layout()
+    plt.show()
 
-# Plot the close price
-ax.plot(prices.index, prices['close'], label=f'{CFG.ticker} Close Price', color='skyblue', linewidth=2)
-
-# Plot buy signals
-ax.plot(buy_points.index, buy_points['close'], '^', markersize=10, color='green', label='Buy Signal', alpha=0.8)
-
-# Plot sell signals
-ax.plot(sell_points.index, sell_points['close'], 'v', markersize=10, color='red', label='Sell Signal', alpha=0.8)
-
-# Formatting
-ax.set_title(f'{CFG.ticker} Price with Buy/Sell Signals', fontsize=16)
-ax.set_xlabel('Date', fontsize=12)
-ax.set_ylabel('Price (USD)', fontsize=12)
-ax.legend(fontsize=10)
-plt.xticks(rotation=45)
-plt.tight_layout()
-
-# Save the plot
-plt.savefig('spy_signals_plot.png')
-plt.close() # Close the plot to free up memory
+    # Printing Buy and Sell Signals
+    buy_df = pd.DataFrame({'Signal': 'Buy', 'Price': test_closes.loc[buy_signals]})
+    sell_df = pd.DataFrame({'Signal': 'Sell', 'Price': test_closes.loc[sell_signals]})
+    signals_df = pd.concat([buy_df, sell_df]).sort_index()
+    
+    print("--- Buy and Sell Signals ---")
+    if signals_df.empty:
+        print("No buy or sell signals were generated for the test period.")
+    else:
+        print(signals_df)
+else:
+    print("No test data to generate signals.")
 
 
 import os
